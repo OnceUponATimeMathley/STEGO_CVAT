@@ -46,6 +46,11 @@ def get_class_labels(dataset_name):
             'roads and cars',
             'buildings and clutter',
             'trees and vegetation']
+    elif dataset_name == "directory":
+        return [
+            'background',
+                      'cat', 'dog', 'bird', 'boat'
+        ]
     else:
         raise ValueError("Unknown Dataset {}".format(dataset_name))
 
@@ -53,29 +58,32 @@ def get_class_labels(dataset_name):
 class LitUnsupervisedSegmenter(pl.LightningModule):
     def __init__(self, n_classes, cfg):
         super().__init__()
+        self.flag = False
         self.cfg = cfg
         self.n_classes = n_classes
 
         if not cfg.continuous:
             dim = n_classes
         else:
-            dim = cfg.dim
+            dim = cfg.dim  #dim: default 70
 
         data_dir = join(cfg.output_root, "data")
         if cfg.arch == "feature-pyramid":
             cut_model = load_model(cfg.model_type, data_dir).cuda()
             self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
         elif cfg.arch == "dino":
-            self.net = DinoFeaturizer(dim, cfg)
+            self.net = DinoFeaturizer(dim, cfg)  #out: batch, 384, h/8, w/8
         else:
             raise ValueError("Unknown arch {}".format(cfg.arch))
 
         self.train_cluster_probe = ClusterLookup(dim, n_classes)
 
         self.cluster_probe = ClusterLookup(dim, n_classes + cfg.extra_clusters)
+        #b, class, h, w
         self.linear_probe = nn.Conv2d(dim, n_classes, (1, 1))
+        #b, c, h, w -> Conv2d -> b, class, h, w
 
-        self.decoder = nn.Conv2d(dim, self.net.n_feats, (1, 1))
+        self.decoder = nn.Conv2d(dim, self.net.n_feats, (1, 1)) # dim, 384-vit_small
 
         self.cluster_metrics = UnsupervisedMetrics(
             "test/cluster/", n_classes, cfg.extra_clusters, True)
@@ -107,9 +115,10 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
     def forward(self, x):
         # in lightning, forward defines the prediction/inference actions
-        return self.net(x)[1]
+        return self.net(x)[1]  # DINO out1: code???
 
     def training_step(self, batch, batch_idx):
+        print("__________________TRAINING STEP__________________")
         # training_step defined the train loop.
         # It is independent of forward
         net_optim, linear_probe_optim, cluster_probe_optim = self.optimizers()
@@ -127,12 +136,30 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             label = batch["label"]
             label_pos = batch["label_pos"]
 
+            # if self.flag == False:
+            #     print("ind shape: ", ind.shape) #8
+            #     print("img shape: ", img.shape) #8, 3, 224, 224
+            #     print("img_aug shape: ", img_aug.shape) #8, 3, 224, 224
+            #     print("coord_aug shape: ", coord_aug.shape) #8, 224, 224, 2
+            #     print("img_pos shape: ", img_pos.shape) #8, 3, 224, 224
+            #     print("label shape: ", label.shape) #8, 1, 224, 224
+            #     print("label_pos shape: ", label.shape) #8, 1, 224, 224
+            #     self.flag = True
+            # return
+
+
+
         feats, code = self.net(img)
+        print("feats shape: ", feats.shape)
+        print("code shape: ", code.shape)
         if self.cfg.correspondence_weight > 0:
-            feats_pos, code_pos = self.net(img_pos)
+            feats_pos, code_pos = self.net(img_pos) #batch, dim, h/8, w/8
+            print("feats_pos shape: ", feats_pos.shape)
+            print("code_pos shape: ", code_pos.shape)
         log_args = dict(sync_dist=False, rank_zero_only=True)
 
-        if self.cfg.use_true_labels:
+
+        if self.cfg.use_true_labels: #Default: False
             signal = one_hot_feats(label + 1, self.n_classes + 1)
             signal_pos = one_hot_feats(label_pos + 1, self.n_classes + 1)
         else:
@@ -144,14 +171,14 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         should_log_hist = (self.cfg.hist_freq is not None) and \
                           (self.global_step % self.cfg.hist_freq == 0) and \
                           (self.global_step > 0)
-        if self.cfg.use_salience:
+        if self.cfg.use_salience: #Default: False
             salience = batch["mask"].to(torch.float32).squeeze(1)
             salience_pos = batch["mask_pos"].to(torch.float32).squeeze(1)
         else:
             salience = None
             salience_pos = None
 
-        if self.cfg.correspondence_weight > 0:
+        if self.cfg.correspondence_weight > 0: #Default: 1.0
             (
                 pos_intra_loss, pos_intra_cd,
                 pos_inter_loss, pos_inter_cd,
@@ -161,6 +188,9 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 salience, salience_pos,
                 code, code_pos,
             )
+
+            #signal, signal_pos: output feature of DINO: b, 384,
+            # code, code_pos: output feature of DINO -> non linear projection: (S in paper)
 
             if should_log_hist:
                 self.logger.experiment.add_histogram("intra_cd", pos_intra_cd, self.global_step)
@@ -209,13 +239,18 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
         flat_label = label.reshape(-1)
         mask = (flat_label >= 0) & (flat_label < self.n_classes)
+        #Why using mask here?
+        # if dataset has it label: mask = true
+        # else: mask = false => linear_loss = 0?
 
         detached_code = torch.clone(code.detach())
 
-        linear_logits = self.linear_probe(detached_code)
+        linear_logits = self.linear_probe(detached_code) #batch, class, h/8, w/8
         linear_logits = F.interpolate(linear_logits, label.shape[-2:], mode='bilinear', align_corners=False)
         linear_logits = linear_logits.permute(0, 2, 3, 1).reshape(-1, self.n_classes)
         linear_loss = self.linear_probe_loss_fn(linear_logits[mask], flat_label[mask]).mean()
+        # linear_probe_loss_fn: CrossEntropyLoss
+        #label: batch, 1, h, w
         loss += linear_loss
         self.log('loss/linear', linear_loss, **log_args)
 
@@ -242,9 +277,11 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.logger.experiment.close()
             self.logger.experiment._get_file_writer()
 
+        print("__________________END TRAINING STEP__________________")
         return loss
 
     def on_train_start(self):
+        # print("ON TRAIN START")
         tb_metrics = {
             **self.linear_metrics.compute(),
             **self.cluster_metrics.compute()
@@ -252,16 +289,23 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         self.logger.log_hyperparams(self.cfg, tb_metrics)
 
     def validation_step(self, batch, batch_idx):
+        # print("validation_step---------------")
         img = batch["img"]
         label = batch["label"]
+        # print("img: ", img.shape)  #8, 3, 320, 320
+        # print("label: ", label.shape) # 8, 1, 3, 320, 320
         self.net.eval()
 
         with torch.no_grad():
             feats, code = self.net(img)
+            # print("feats: ", feats.shape) # 8, 384, 40, 40
+            # print("code: ", code.shape)
             code = F.interpolate(code, label.shape[-2:], mode='bilinear', align_corners=False)
-
+            # print("code 2: ", code.shape)
             linear_preds = self.linear_probe(code)
+            # print("linear_preds: ", linear_preds.shape)
             linear_preds = linear_preds.argmax(1)
+            # print("linear_preds_arg: ", linear_preds.shape)
             self.linear_metrics.update(linear_preds, label)
 
             cluster_loss, cluster_preds = self.cluster_probe(code, None)
@@ -275,6 +319,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 "label": label[:self.cfg.n_images].detach().cpu()}
 
     def validation_epoch_end(self, outputs) -> None:
+        # print("validation_epoch_end------------------")
         super().validation_epoch_end(outputs)
         with torch.no_grad():
             tb_metrics = {
@@ -290,7 +335,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 fig, ax = plt.subplots(4, self.cfg.n_images, figsize=(self.cfg.n_images * 3, 4 * 3))
                 for i in range(self.cfg.n_images):
                     ax[0, i].imshow(prep_for_plot(output["img"][i]))
-                    ax[1, i].imshow(self.label_cmap[output["label"][i]])
+                    ax[1, i].imshow(self.label_cmap[output["label"][i][0]])  # add [0] to fix
                     ax[2, i].imshow(self.label_cmap[output["linear_preds"][i]])
                     ax[3, i].imshow(self.label_cmap[self.cluster_metrics.map_clusters(output["cluster_preds"][i])])
                 ax[0, 0].set_ylabel("Image", fontsize=16)
@@ -371,6 +416,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.cluster_metrics.reset()
 
     def configure_optimizers(self):
+        print("configure_optimizers-------------------")
         main_params = list(self.net.parameters())
 
         if self.cfg.rec_weight > 0:
@@ -407,7 +453,7 @@ def my_app(cfg: DictConfig) -> None:
 
     geometric_transforms = T.Compose([
         T.RandomHorizontalFlip(),
-        T.RandomResizedCrop(size=cfg.res, scale=(0.8, 1.0))
+        T.RandomResizedCrop(size=cfg.res, scale=(0.8, 1.0)) #224
     ])
     photometric_transforms = T.Compose([
         T.ColorJitter(brightness=.3, contrast=.3, saturation=.3, hue=.1),
@@ -473,7 +519,7 @@ def my_app(cfg: DictConfig) -> None:
             gpu_args.pop("val_check_interval")
 
     else:
-        gpu_args = dict(gpus=-1, accelerator='ddp', val_check_interval=cfg.val_freq)
+        gpu_args = dict(gpus=-1, accelerator='cuda', val_check_interval=cfg.val_freq)
         # gpu_args = dict(gpus=1, accelerator='ddp', val_check_interval=cfg.val_freq)
 
         if gpu_args["val_check_interval"] > len(train_loader) // 4:
@@ -494,7 +540,9 @@ def my_app(cfg: DictConfig) -> None:
         ],
         **gpu_args
     )
+    print("HELLLLO")
     trainer.fit(model, train_loader, val_loader)
+    print("??????????????????????????//")
 
 
 if __name__ == "__main__":

@@ -17,8 +17,10 @@ def get_feats(model, loader):
     for pack in tqdm(loader):
         img = pack["img"]
         feats = F.normalize(model.forward(img.cuda()).mean([2, 3]), dim=1)
+        # print("Image shape: ", img.shape) #torch.Size([16, 384, 28, 28])
+        # print("DINO output shape: ", (model.forward(img.cuda()).shape)) #
         all_feats.append(feats.to("cpu", non_blocking=True))
-    return torch.cat(all_feats, dim=0).contiguous()
+    return torch.cat(all_feats, dim=0).contiguous() #N, 384
 
 
 @hydra.main(config_path="configs", config_name="train_config.yml")
@@ -37,12 +39,13 @@ def my_app(cfg: DictConfig) -> None:
     print(cfg.output_root)
 
     image_sets = ["val", "train"]
-    dataset_names = ["cocostuff27", "cityscapes", "potsdam"]
-    crop_types = ["five", None]
+    # dataset_names = ["cocostuff27", "cityscapes", "potsdam"]
+    # dataset_names = ['potsdam']
+    # crop_types = ["five", None]
 
     # Uncomment these lines to run on custom datasets
-    #dataset_names = ["directory"]
-    #crop_types = [None]
+    dataset_names = ["directory"]
+    crop_types = ["five", None]
 
     res = 224
     n_batches = 16
@@ -50,7 +53,7 @@ def my_app(cfg: DictConfig) -> None:
     if cfg.arch == "dino":
         from modules import DinoFeaturizer, LambdaLayer
         no_ap_model = torch.nn.Sequential(
-            DinoFeaturizer(20, cfg),  # dim doesent matter
+            DinoFeaturizer(20, cfg),  # dim doesent matter b, 384, h/8, w/8
             LambdaLayer(lambda p: p[0]),
         ).cuda()
     else:
@@ -85,11 +88,11 @@ def my_app(cfg: DictConfig) -> None:
                         all_nns = []
                         step = normed_feats.shape[0] // n_batches
                         print(normed_feats.shape)
-                        for i in tqdm(range(0, normed_feats.shape[0], step)):
+                        for i in tqdm(range(0, normed_feats.shape[0], step)): #step: 16
                             torch.cuda.empty_cache()
                             batch_feats = normed_feats[i:i + step, :]
                             pairwise_sims = torch.einsum("nf,mf->nm", batch_feats, normed_feats)
-                            all_nns.append(torch.topk(pairwise_sims, 30)[1])
+                            all_nns.append(torch.topk(pairwise_sims, 4)[1])
                             del pairwise_sims
                         nearest_neighbors = torch.cat(all_nns, dim=0)
 

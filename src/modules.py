@@ -29,7 +29,8 @@ class DinoFeaturizer(nn.Module):
             num_classes=0)
         for p in self.model.parameters():
             p.requires_grad = False
-        self.model.eval().cuda()
+        # self.model.eval().cuda()
+        self.model.eval()
         self.dropout = torch.nn.Dropout2d(p=.1)
 
         if arch == "vit_small" and patch_size == 16:
@@ -137,15 +138,15 @@ class ClusterLookup(nn.Module):
         super(ClusterLookup, self).__init__()
         self.n_classes = n_classes
         self.dim = dim
-        self.clusters = torch.nn.Parameter(torch.randn(n_classes, dim))
+        self.clusters = torch.nn.Parameter(torch.randn(n_classes, dim)) # 5, 70
 
     def reset_parameters(self):
         with torch.no_grad():
             self.clusters.copy_(torch.randn(self.n_classes, self.dim))
 
     def forward(self, x, alpha, log_probs=False):
-        normed_clusters = F.normalize(self.clusters, dim=1)
-        normed_features = F.normalize(x, dim=1)
+        normed_clusters = F.normalize(self.clusters, dim=1) # n, c
+        normed_features = F.normalize(x, dim=1)  #b, c, h, w
         inner_products = torch.einsum("bchw,nc->bnhw", normed_features, normed_clusters)
 
         if alpha is None:
@@ -153,8 +154,13 @@ class ClusterLookup(nn.Module):
                 .permute(0, 3, 1, 2).to(torch.float32)
         else:
             cluster_probs = nn.functional.softmax(inner_products * alpha, dim=1)
+            # Probability for class in every pixel
 
         cluster_loss = -(cluster_probs * inner_products).sum(1).mean()
+        # bnhw * bnhw -> bnhw-> sum(1) -> bhw-> mean() -
+
+        # Ex: [0.1, 0.2, 0.7]-> [a1<a2<a3]=> 0.1a1+ 0.2a2+0.7a3
+
         if log_probs:
             return nn.functional.log_softmax(inner_products * alpha, dim=1)
         else:
@@ -286,7 +292,7 @@ def tensor_correlation(a, b):
 
 def sample(t: torch.Tensor, coords: torch.Tensor):
     return F.grid_sample(t, coords.permute(0, 2, 1, 3), padding_mode='border', align_corners=True)
-
+  # B, 384, h/8, w/8   B, 11, 11, 2 => B, 384, 11, 11
 
 @torch.jit.script
 def super_perm(size: int, device: torch.device):
@@ -327,22 +333,27 @@ class ContrastiveCorrelationLoss(nn.Module):
             # Comes straight from backbone which is currently frozen. this saves mem.
             fd = tensor_correlation(norm(f1), norm(f2))
 
-            if self.cfg.pointwise:
+            #norm(f1): -> b, dim, h, w: in dim: probability of dim class
+            #norm: Equation (1) in paper: don't need to divide norm c-vector
+
+
+
+            if self.cfg.pointwise:    #Default: True
                 old_mean = fd.mean()
-                fd -= fd.mean([3, 4], keepdim=True)
+                fd -= fd.mean([3, 4], keepdim=True) # Equation (3)
                 fd = fd - fd.mean() + old_mean
 
         cd = tensor_correlation(norm(c1), norm(c2))
 
-        if self.cfg.zero_clamp:
+        if self.cfg.zero_clamp: # Default: True
             min_val = 0.0
         else:
             min_val = -9999.0
 
-        if self.cfg.stabalize:
+        if self.cfg.stabalize: #Default: False
             loss = - cd.clamp(min_val, .8) * (fd - shift)
         else:
-            loss = - cd.clamp(min_val) * (fd - shift)
+            loss = - cd.clamp(min_val) * (fd - shift) # min, max
 
         return loss, cd
 
@@ -352,8 +363,10 @@ class ContrastiveCorrelationLoss(nn.Module):
                 orig_code: torch.Tensor, orig_code_pos: torch.Tensor,
                 ):
 
+        #Shape: B, 384, H, W             B, 70, H, W
+        print("___________LOSS INFO________________________")
         coord_shape = [orig_feats.shape[0], self.cfg.feature_samples, self.cfg.feature_samples, 2]
-
+        #b, 11, 11, 2
         if self.cfg.use_salience:
             coords1_nonzero = sample_nonzero_locations(orig_salience, coord_shape)
             coords2_nonzero = sample_nonzero_locations(orig_salience_pos, coord_shape)
@@ -362,15 +375,15 @@ class ContrastiveCorrelationLoss(nn.Module):
             mask = (torch.rand(coord_shape[:-1], device=orig_feats.device) > .1).unsqueeze(-1).to(torch.float32)
             coords1 = coords1_nonzero * mask + coords1_reg * (1 - mask)
             coords2 = coords2_nonzero * mask + coords2_reg * (1 - mask)
-        else:
+        else: #random value in [-1, 1)
             coords1 = torch.rand(coord_shape, device=orig_feats.device) * 2 - 1
             coords2 = torch.rand(coord_shape, device=orig_feats.device) * 2 - 1
 
-        feats = sample(orig_feats, coords1)
-        code = sample(orig_code, coords1)
+        feats = sample(orig_feats, coords1) # b, 384, 11, 11
+        code = sample(orig_code, coords1) # b, 70, 11, 11
 
-        feats_pos = sample(orig_feats_pos, coords2)
-        code_pos = sample(orig_code_pos, coords2)
+        feats_pos = sample(orig_feats_pos, coords2) # b, 384, 11, 11
+        code_pos = sample(orig_code_pos, coords2) # b, 70, 11, 11
 
         pos_intra_loss, pos_intra_cd = self.helper(
             feats, feats, code, code, self.cfg.pos_intra_shift)
@@ -379,7 +392,7 @@ class ContrastiveCorrelationLoss(nn.Module):
 
         neg_losses = []
         neg_cds = []
-        for i in range(self.cfg.neg_samples):
+        for i in range(self.cfg.neg_samples): #neg_samples: 5
             perm_neg = super_perm(orig_feats.shape[0], orig_feats.device)
             feats_neg = sample(orig_feats[perm_neg], coords2)
             code_neg = sample(orig_code[perm_neg], coords2)

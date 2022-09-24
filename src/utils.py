@@ -220,6 +220,9 @@ class UnsupervisedMetrics(Metric):
         with torch.no_grad():
             actual = target.reshape(-1)
             preds = preds.reshape(-1)
+            # print("UPDATE")
+            # print("actual: ", actual.shape)
+            # print("pred: ", preds.shape)
             mask = (actual >= 0) & (actual < self.n_classes) & (preds >= 0) & (preds < self.n_classes)
             actual = actual[mask]
             preds = preds[mask]

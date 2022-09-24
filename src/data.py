@@ -75,8 +75,8 @@ def create_cityscapes_colormap():
 class DirectoryDataset(Dataset):
     def __init__(self, root, path, image_set, transform, target_transform):
         super(DirectoryDataset, self).__init__()
-        self.split = image_set
-        self.dir = join(root, path)
+        self.split = image_set  #train, val
+        self.dir = join(root, path) #./datasets/custom
         self.img_dir = join(self.dir, "imgs", self.split)
         self.label_dir = join(self.dir, "labels", self.split)
 
@@ -108,6 +108,8 @@ class DirectoryDataset(Dataset):
             random.seed(seed)
             torch.manual_seed(seed)
             label = self.target_transform(label)
+            label = label.mean(dim=-1, dtype=torch.float32) #Fix bug label
+            label = label.to(torch.int64) #FIXED
         else:
             label = torch.zeros(img.shape[1], img.shape[2], dtype=torch.int64) - 1
 
@@ -488,20 +490,22 @@ class ContrastiveSegDataset(Dataset):
         self.aug_geometric_transform = aug_geometric_transform
         self.aug_photometric_transform = aug_photometric_transform
 
-        self.dataset = dataset_class(
+        self.dataset = dataset_class( #CroppedDataset
             root=pytorch_data_dir,
-            image_set=self.image_set,
-            transform=transform,
+            image_set=self.image_set,  #train
+            transform=transform, #get_transform(cfg.res, False, cfg.loader_crop_type)
             target_transform=target_transform, **extra_args)
 
         if model_type_override is not None:
             model_type = model_type_override
         else:
-            model_type = cfg.model_type
+            model_type = cfg.model_type  #vit_small
 
         nice_dataset_name = cfg.dir_dataset_name if dataset_name == "directory" else dataset_name
+        # cocostuff
         feature_cache_file = join(pytorch_data_dir, "nns", "nns_{}_{}_{}_{}_{}.npz".format(
             model_type, nice_dataset_name, image_set, crop_type, cfg.res))
+        # ./datasets/nns/nns_vit_small_cocostuff27_train_five_224.npz
         if pos_labels or pos_images:
             if not os.path.exists(feature_cache_file) or compute_knns:
                 raise ValueError("could not find nn file {} please run precompute_knns".format(feature_cache_file))
@@ -518,11 +522,15 @@ class ContrastiveSegDataset(Dataset):
         torch.manual_seed(seed)  # needed for torchvision 0.7
 
     def __getitem__(self, ind):
+        # print("______________GET ITEM______________")
         pack = self.dataset[ind]
-
+        # print("Len Pack: ", len(pack))
+        # print(pack[0].shape) # 3, 224, 224
+        
+ 
         if self.pos_images or self.pos_labels:
             ind_pos = self.nns[ind][torch.randint(low=1, high=self.num_neighbors + 1, size=[]).item()]
-            pack_pos = self.dataset[ind_pos]
+            pack_pos = self.dataset[ind_pos] # img, label, mask
 
         seed = np.random.randint(2147483647)  # make a seed with numpy generator
 
@@ -560,6 +568,7 @@ class ContrastiveSegDataset(Dataset):
             coord_aug = self.aug_geometric_transform(coord)
 
             ret["img_aug"] = img_aug
-            ret["coord_aug"] = coord_aug.permute(1, 2, 0)
+            ret["coord_aug"] = coord_aug.permute(1, 2, 0) # h, w, 2
 
+        # print("______________END GET ITEM______________")
         return ret

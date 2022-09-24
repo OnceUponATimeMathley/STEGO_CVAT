@@ -1,0 +1,10 @@
+wget
+torchmetrics
+hydra-core
+git+https://github.com/lucasb-eyer/pydensecrf.git
+omegaconf
+pytorch-lightning
+matplotlib
+scipy
+torchvision
+seaborn

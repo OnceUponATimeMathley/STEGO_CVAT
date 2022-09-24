@@ -1,20 +1,20 @@
 output_root: '../'
-pytorch_data_dir: '/datadrive/pytorch-data/'
+pytorch_data_dir: './datasets/'
 experiment_name: "exp1"
-log_dir: "cocostuff27"
+log_dir: "custom"
 azureml_logging: True
 submitting_to_aml: False
 
 # Loader params
-num_workers: 24
+num_workers: 2
 max_steps: 5000
-batch_size: 16
+batch_size: 8
 
-num_neighbors: 7
-dataset_name: "cocostuff27"
+num_neighbors: 4
+dataset_name: "directory"
 
 # Used if dataset_name is "directory"
-dir_dataset_name: ~
+dir_dataset_name: "custom"
 dir_dataset_n_classes: 5
 
 has_labels: False
